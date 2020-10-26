@@ -3,9 +3,10 @@
 
 use std::cmp;
 use std::cmp::Ordering;
+use std::cell::{RefCell, RefMut};
 
-use rand::prelude::ThreadRng;
-use rand::Rng;
+use rand::rngs::mock::StepRng;
+use rand::{Rng, RngCore};
 use slog::Logger;
 
 use crypto::hash::{BlockHash, ChainId};
@@ -17,6 +18,38 @@ use tezos_messages::p2p::encoding::current_branch::HISTORY_MAX_SIZE;
 
 use crate::collections::{BlockData, UniqueBlockData};
 use crate::shell_channel::BlockApplied;
+
+struct MaybeRng<'a>(Option<RefMut<'a, StepRng>>);
+
+impl<'a> RngCore for MaybeRng<'a> {
+    fn next_u32(&mut self) -> u32 {
+        match self.0.as_deref_mut() {
+            Some(r) => r.next_u32(),
+            None => rand::thread_rng().next_u32(),
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        match self.0.as_deref_mut() {
+            Some(r) => r.next_u64(),
+            None => rand::thread_rng().next_u64(),
+        }
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        match self.0.as_deref_mut() {
+            Some(r) => r.fill_bytes(dest),
+            None => rand::thread_rng().fill_bytes(dest),
+        }
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+        match self.0.as_deref_mut() {
+            Some(r) => r.try_fill_bytes(dest),
+            None => rand::thread_rng().try_fill_bytes(dest),
+        }
+    }
+}
 
 /// Holds state of all known blocks
 pub struct BlockchainState {
@@ -34,6 +67,8 @@ pub struct BlockchainState {
     /// of the [`chain_manager`](crate::chain_manager::ChainManager) to return the block to this queue.
     missing_blocks: UniqueBlockData<MissingBlock>,
     chain_id: ChainId,
+    /// predictable rng for testing
+    rng: Option<RefCell<StepRng>>,
 }
 
 impl BlockchainState {
@@ -44,6 +79,7 @@ impl BlockchainState {
             chain_meta_storage: ChainMetaStorage::new(persistent_storage),
             missing_blocks: UniqueBlockData::new(),
             chain_id: chain_id.clone(),
+            rng: Some(RefCell::new(StepRng::new(0x123456789abcdef0, 0xabcdef0123456789))),
         }
     }
 
@@ -102,7 +138,6 @@ impl BlockchainState {
 
     #[inline]
     pub fn push_missing_history(&mut self, history: Vec<BlockHash>, level: Level) -> Result<(), StorageError> {
-        let mut rng = rand::thread_rng();
         let history_max_parts = if history.len() < usize::from(HISTORY_MAX_SIZE) {
             history.len() as u8
         } else {
@@ -111,10 +146,12 @@ impl BlockchainState {
 
         history.iter().enumerate()
             .map(|(idx, history_block_hash)| {
+                let rng = MaybeRng(self.rng.as_ref().map(RefCell::borrow_mut));
+                let level = Self::guess_level(rng, level, history_max_parts, idx);
                 self.push_missing_block(
                     MissingBlock::with_level_guess(
                         history_block_hash.clone(),
-                        Self::guess_level(&mut rng, level, history_max_parts, idx),
+                        level,
                     )
                 )
             })
@@ -171,7 +208,10 @@ impl BlockchainState {
         Ok(history)
     }
 
-    fn guess_level(rng: &mut ThreadRng, level: Level, parts: u8, index: usize) -> i32 {
+    fn guess_level<R>(mut rng: R, level: Level, parts: u8, index: usize) -> i32
+    where
+        R: rand::Rng,
+    {
         // e.g. we have: level 100 a 5 record in history, so split is 20, never <= 0
         let split = level / i32::from(parts);
         // corner case for 1 level;

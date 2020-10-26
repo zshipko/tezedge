@@ -324,7 +324,7 @@ impl Receive<SendMessage> for Peer {
         self.tokio_executor.spawn(async move {
             let mut tx_lock = tx.lock().await;
             if let Some(tx) = tx_lock.as_mut() {
-                let write_result = timeout(IO_TIMEOUT, tx.write_message(&*msg.message)).await;
+                let write_result = timeout(IO_TIMEOUT, tx.write_peer_response(&msg.message)).await;
                 // release mutex as soon as possible
                 drop(tx_lock);
 
@@ -370,14 +370,14 @@ pub async fn bootstrap(
         vec![supported_protocol_version.clone()]);
     let connection_message_sent = {
         let connection_message_bytes = BinaryChunk::from_content(&connection_message.as_bytes()?)?;
-        match timeout(IO_TIMEOUT, msg_tx.write_message(&connection_message_bytes)).await? {
+        match timeout(IO_TIMEOUT, msg_tx.write_message(connection_message_bytes.raw())).await? {
             Ok(_) => connection_message_bytes,
             Err(e) => return Err(PeerError::NetworkError { error: e.into(), message: "Failed to transfer connection message" })
         }
     };
 
     // receive connection message
-    let received_connection_message_bytes = match timeout(IO_TIMEOUT, msg_rx.read_message()).await? {
+    let received_connection_message_bytes = match timeout(IO_TIMEOUT, msg_rx.read_single_chunk()).await? {
         Ok(msg) => msg,
         Err(e) => return Err(PeerError::NetworkError { error: e.into(), message: "No response to connection message was received" })
     };
@@ -466,7 +466,7 @@ async fn begin_process_incoming(mut rx: EncryptedMessageReader, net: Network, my
     info!(log, "Starting to accept messages"; "ip" => format!("{:?}", &peer_address));
 
     while net.rx_run.load(Ordering::Acquire) {
-        match timeout(READ_TIMEOUT_LONG, rx.read_message::<PeerMessageResponse>()).await {
+        match timeout(READ_TIMEOUT_LONG, rx.read_peer_response()).await {
             Ok(res) => match res {
                 Ok(msg) => {
                     let should_broadcast_message = net.rx_run.load(Ordering::Acquire);

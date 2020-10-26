@@ -6,9 +6,8 @@
 //! It provides message packaging from/to binary format, encryption, message nonce handling.
 
 use std::convert::TryInto;
-use std::io;
+use std::marker::PhantomData;
 
-use bytes::Buf;
 use failure::{Error, Fail};
 use failure::_core::time::Duration;
 use slog::{FnValue, Logger, o, trace};
@@ -19,7 +18,10 @@ use tokio::prelude::*;
 use crypto::crypto_box::{CryptoError, decrypt, encrypt, PrecomputedKey};
 use crypto::nonce::Nonce;
 use tezos_encoding::binary_reader::BinaryReaderError;
-use tezos_messages::p2p::binary_message::{BinaryChunk, BinaryChunkError, BinaryMessage, CONTENT_LENGTH_FIELD_BYTES};
+use tezos_messages::p2p::{
+    binary_message::{BinaryChunk, BinaryChunkError, BinaryMessage, CONTENT_LENGTH_FIELD_BYTES},
+    encoding::peer::PeerMessageResponse,
+};
 
 use crate::p2p::peer::PeerId;
 
@@ -96,7 +98,7 @@ impl MessageStream {
 
         let (rx, tx) = tokio::io::split(stream);
         MessageStream {
-            reader: MessageReader { stream: rx },
+            reader: MessageReader { stream: rx, buffer: Vec::new() },
             writer: MessageWriter { stream: tx },
         }
     }
@@ -116,34 +118,44 @@ impl From<TcpStream> for MessageStream {
 /// Reader of the TCP/IP connection.
 pub struct MessageReader {
     /// reader part or the TCP/IP network stream
-    stream: ReadHalf<TcpStream>
+    stream: ReadHalf<TcpStream>,
+    /// buffer containing bytes of partially received chunk
+    buffer: Vec<u8>,
 }
 
 impl MessageReader {
-    /// Read message from network and return message contents in a form of bytes.
-    /// Each message is prefixed by a 2 bytes indicating total length of the message.
-    pub async fn read_message(&mut self) -> Result<BinaryChunk, StreamError> {
-        // read encoding length (2 bytes)
-        let msg_len_bytes = self.read_message_length_bytes().await?;
-        // copy bytes containing encoding length to raw encoding buffer
-        let mut all_recv_bytes = vec![];
-        all_recv_bytes.extend(&msg_len_bytes);
-
-        // read the message contents
-        let msg_len = (&msg_len_bytes[..]).get_u16() as usize;
-        let mut msg_content_bytes = vec![0u8; msg_len];
-        self.stream.read_exact(&mut msg_content_bytes).await?;
-        all_recv_bytes.extend(&msg_content_bytes);
-
-        Ok(all_recv_bytes.try_into()?)
+    /// Read only one chunk from network and return its content in a form of bytes.
+    pub async fn read_single_chunk(&mut self) -> Result<BinaryChunk, StreamError> {
+        loop {
+            match self.next() {
+                Some(m) => break Ok(m),
+                None => {
+                    let _ = self.fill_buffer().await?;
+                },
+            }
+        }
     }
 
-    /// Read 2 bytes containing total length of the message contents from the network stream.
-    /// Total length is encoded as u big endian u16.
-    async fn read_message_length_bytes(&mut self) -> io::Result<[u8; CONTENT_LENGTH_FIELD_BYTES]> {
-        let mut msg_len_bytes: [u8; CONTENT_LENGTH_FIELD_BYTES] = [0; CONTENT_LENGTH_FIELD_BYTES];
-        self.stream.read_exact(&mut msg_len_bytes).await?;
-        Ok(msg_len_bytes)
+    fn next(&mut self) -> Option<BinaryChunk> {
+        if self.buffer.len() >= CONTENT_LENGTH_FIELD_BYTES {
+            let len = u16::from_be_bytes(self.buffer[0..CONTENT_LENGTH_FIELD_BYTES].try_into().unwrap()) as usize;
+            if self.buffer.len() >= CONTENT_LENGTH_FIELD_BYTES + len {
+                let rest = self.buffer.split_off(CONTENT_LENGTH_FIELD_BYTES + len);
+                let raw_chunk = std::mem::replace(&mut self.buffer, rest);
+                Some(raw_chunk.try_into().unwrap())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    async fn fill_buffer(&mut self) -> Result<usize, StreamError> {
+        let mut buf = [0; 0x10000];
+        let read = self.stream.read(buf.as_mut()).await?;
+        self.buffer.extend_from_slice(&buf[..read]);
+        Ok(read)
     }
 }
 
@@ -160,8 +172,8 @@ impl MessageWriter {
     /// In case all bytes are successfully written to network stream a raw binary
     /// message is returned as a result.
     #[inline]
-    pub async fn write_message(&mut self, bytes: &BinaryChunk) -> Result<(), StreamError> {
-        Ok(self.stream.write_all(bytes.raw()).await?)
+    pub async fn write_message(&mut self, bytes: &Vec<u8>) -> Result<(), StreamError> {
+        Ok(self.stream.write_all(bytes.as_ref()).await?)
     }
 }
 
@@ -185,10 +197,26 @@ impl EncryptedMessageWriter {
         EncryptedMessageWriter { tx, precomputed_key, nonce_local, log }
     }
 
-    pub async fn write_message<'a>(&'a mut self, message: &'a impl BinaryMessage) -> Result<(), StreamError> {
+    pub async fn write_peer_response(&mut self, message: &PeerMessageResponse) -> Result<(), StreamError> {
+        match message.messages().len() {
+            0 => Ok(()),
+            _ => {
+                let mut all_bytes = Vec::new();
+                for message in message.messages() {
+                    let message = PeerMessageResponse::new(vec![message.clone()]);
+                    let mut bytes = self.encrypt_message(&message)?;
+                    all_bytes.append(&mut bytes);
+                }
+                self.tx.write_message(&all_bytes).await
+            }
+        }
+    }
+
+    pub fn encrypt_message<'a>(&'a mut self, message: &'a impl BinaryMessage) -> Result<Vec<u8>, StreamError> {
         let message_bytes = message.as_bytes()?;
         trace!(self.log, "Writing message"; "message" => FnValue(|_| hex::encode(&message_bytes)));
 
+        let mut bytes = Vec::new();
         for chunk_content_bytes in message_bytes.chunks(CONTENT_LENGTH_MAX) {
             // encrypt
             let message_bytes_encrypted = match encrypt(chunk_content_bytes, &self.nonce_fetch_increment(), &self.precomputed_key) {
@@ -196,12 +224,16 @@ impl EncryptedMessageWriter {
                 Err(error) => return Err(StreamError::FailedToEncryptMessage { error })
             };
 
-            // send
             let chunk = BinaryChunk::from_content(&message_bytes_encrypted)?;
-            self.tx.write_message(&chunk).await?;
+            bytes.extend_from_slice(chunk.raw());
         }
 
-        Ok(())
+        Ok(bytes)
+    }
+
+    pub async fn write_message<'a>(&'a mut self, message: &'a impl BinaryMessage) -> Result<(), StreamError> {
+        let bytes = self.encrypt_message(message)?;
+        self.tx.write_message(&bytes).await
     }
 
     #[inline]
@@ -225,6 +257,54 @@ pub struct EncryptedMessageReader {
     log: Logger,
 }
 
+/// Contains bytes of partially received message
+struct MessageBuffer<M> {
+    input_remaining: usize,
+    input_data: Vec<u8>,
+    phantom_data: PhantomData<M>,
+}
+
+impl<M> MessageBuffer<M>
+where
+    M: BinaryMessage,
+{
+    pub fn new() -> Self {
+        MessageBuffer {
+            input_remaining: 0,
+            input_data: Vec::new(),
+            phantom_data: PhantomData,
+        }
+    }
+
+    pub fn push(&mut self, logger: &Logger, mut decrypted: Vec<u8>) -> Result<Option<M>, StreamError> {
+        trace!(logger, "Message received"; "message" => FnValue(|_| hex::encode(&decrypted)));
+        if self.input_remaining >= decrypted.len() {
+            self.input_remaining -= decrypted.len();
+        } else {
+            // here should be a warning
+            self.input_remaining = 0;
+        }
+
+        self.input_data.append(&mut decrypted);
+
+        if self.input_remaining == 0 {
+            match M::from_bytes(&self.input_data) {
+                Ok(message) => {
+                    self.input_data = Vec::new();
+                    Ok(Some(message))
+                },
+                Err(BinaryReaderError::Underflow { bytes }) => {
+                    self.input_remaining += bytes;
+                    Ok(None)
+                },
+                Err(e) => Err(e.into()),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 impl EncryptedMessageReader {
     /// Create new encrypted message from async reader and peer data
     pub fn new(rx: MessageReader, precomputed_key: PrecomputedKey, nonce_remote: Nonce, peer_id: PeerId, log: Logger) -> Self {
@@ -232,17 +312,38 @@ impl EncryptedMessageReader {
         EncryptedMessageReader { rx, precomputed_key, nonce_remote, log }
     }
 
-    /// Consume content of inner message reader into specific message
+    pub async fn read_peer_response(&mut self) -> Result<PeerMessageResponse, StreamError> {
+        let mut full_message = Vec::new();
+        let mut buffer = MessageBuffer::<PeerMessageResponse>::new();
+
+        loop {
+            if let Some(encrypted) = self.rx.next() {
+                let decrypted = decrypt(encrypted.content(), &self.nonce_fetch_increment(), &self.precomputed_key)
+                    .map_err(|error| StreamError::FailedToDecryptMessage { error })?;
+                if let Some(message) = buffer.push(&self.log, decrypted)? {
+                    full_message.push(message);
+                    if self.rx.buffer.is_empty() {
+                        break;
+                    }
+                }
+            } else {
+                self.rx.fill_buffer().await?;
+            }
+        }
+
+        Ok(PeerMessageResponse::flatten(full_message))
+    }
+
     pub async fn read_message<M>(&mut self) -> Result<M, StreamError>
-        where
-            M: BinaryMessage
+    where
+        M: BinaryMessage,
     {
         let mut input_remaining = 0;
         let mut input_data = vec![];
 
         loop {
             // read
-            let message_encrypted = self.rx.read_message().await?;
+            let message_encrypted = self.rx.read_single_chunk().await?;
 
             // decrypt
             match decrypt(message_encrypted.content(), &self.nonce_fetch_increment(), &self.precomputed_key) {

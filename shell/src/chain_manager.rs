@@ -12,7 +12,7 @@
 //! see more description in [process_shell_channel_message][ShellChannelMsg::BlockApplied]
 
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -44,10 +44,6 @@ const BLOCK_HEADERS_BATCH_SIZE: usize = 10;
 const BLOCK_OPERATIONS_BATCH_SIZE: usize = 10;
 /// Limit to how many mempool operations to request in a batch
 const MEMPOOL_OPERATIONS_BATCH_SIZE: usize = 10;
-/// How often to check chain completeness
-const CHECK_CHAIN_COMPLETENESS_INTERVAL: Duration = Duration::from_secs(30);
-/// How often to ask all connected peers for current branch
-const ASK_CURRENT_BRANCH_INTERVAL: Duration = Duration::from_secs(15);
 /// How often to print stats in logs
 const LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// After this time we will disconnect peer if his current head level stays the same
@@ -229,6 +225,8 @@ impl ChainManager {
     fn check_chain_completeness(&mut self, ctx: &Context<ChainManagerMsg>) -> Result<(), Error> {
         let ChainManager { peers, chain_state, operations_state, stats, .. } = self;
 
+        let mut peer_messages = HashMap::<_, PeerMessageResponse>::new();
+
         // check for missing blocks
         if chain_state.has_missing_blocks() {
             peers.values_mut()
@@ -254,7 +252,8 @@ impl ChainManager {
 
                         if !queued_blocks.is_empty() {
                             peer.block_request_last = Instant::now();
-                            tell_peer(GetBlockHeadersMessage::new(queued_blocks).into(), peer);
+                            let response = peer_messages.entry(peer.peer_ref.cell.uri().clone()).or_insert_with(|| PeerMessageResponse::new(vec![]));
+                            response.push(GetBlockHeadersMessage::new(queued_blocks).into());
                         }
                     }
                 });
@@ -285,10 +284,17 @@ impl ChainManager {
                         if !queued_operations.is_empty() {
                             peer.block_operations_request_last = Instant::now();
                             queued_operations.iter()
-                                .for_each(|&missing_operation| tell_peer(GetOperationsForBlocksMessage::new(missing_operation.into()).into(), peer));
+                                .for_each(|&missing_operation| {
+                                    let response = peer_messages.entry(peer.peer_ref.cell.uri().clone()).or_insert_with(|| PeerMessageResponse::new(vec![]));
+                                    response.push(GetOperationsForBlocksMessage::new(missing_operation.into()).into());
+                                });
                         }
                     }
                 });
+        }
+
+        for (peer, message) in peer_messages {
+            peers[&peer].peer_ref.tell(SendMessage::new(message), None);
         }
 
         if let (Some(applied_block_last), Some(hydrated_state_last)) = (stats.applied_block_last, stats.hydrated_state_last) {
@@ -333,6 +339,7 @@ impl ChainManager {
 
                 match peers.get_mut(received.peer.uri()) {
                     Some(peer) => {
+                        let mut should_check_chain_completeness = false;
                         for message in received.message.messages() {
                             match message {
                                 PeerMessage::CurrentBranch(message) => {
@@ -390,7 +397,7 @@ impl ChainManager {
                                         }, Some(ctx.myself().into()));
 
                                     // trigger CheckChainCompleteness
-                                    ctx.myself().tell(CheckChainCompleteness, None);
+                                    should_check_chain_completeness = true;
                                 }
                                 PeerMessage::GetCurrentBranch(message) => {
                                     debug!(log, "Current branch requested by a peer");
@@ -421,7 +428,7 @@ impl ChainManager {
                                                 stats.unseen_block_count += 1;
 
                                                 // trigger CheckChainCompleteness
-                                                ctx.myself().tell(CheckChainCompleteness, None);
+                                                should_check_chain_completeness = true;
 
                                                 // notify others that new block was received
                                                 shell_channel.tell(
@@ -476,7 +483,7 @@ impl ChainManager {
                                                     stats.unseen_block_operations_last = Instant::now();
 
                                                     // trigger CheckChainCompleteness
-                                                    ctx.myself().tell(CheckChainCompleteness, None);
+                                                    should_check_chain_completeness = true;
 
                                                     // notify others that new all operations for block were received
                                                     let block_meta = block_meta_storage.get(&block_hash)?.ok_or(StorageError::MissingKey)?;
@@ -575,6 +582,15 @@ impl ChainManager {
                                 }
                                 ignored_message => trace!(log, "Ignored message"; "message" => format!("{:?}", ignored_message))
                             }
+                        }
+                        if should_check_chain_completeness {
+                            if !self.shutting_down {
+                                match self.check_chain_completeness(ctx) {
+                                    Ok(_) => (),
+                                    Err(e) => warn!(ctx.system.log(), "Failed to check chain completeness"; "reason" => format!("{:?}", e)),
+                                }
+                            }
+                            //ctx.myself().tell(CheckChainCompleteness, None);
                         }
                     }
                     None => debug!(log, "Received message from non-existing peer")
@@ -893,18 +909,6 @@ impl Actor for ChainManager {
         self.hydrate_state(ctx);
 
         ctx.schedule::<Self::Msg, _>(
-            CHECK_CHAIN_COMPLETENESS_INTERVAL / 4,
-            CHECK_CHAIN_COMPLETENESS_INTERVAL,
-            ctx.myself(),
-            None,
-            CheckChainCompleteness.into());
-        ctx.schedule::<Self::Msg, _>(
-            ASK_CURRENT_BRANCH_INTERVAL,
-            ASK_CURRENT_BRANCH_INTERVAL,
-            ctx.myself(),
-            None,
-            AskPeersAboutCurrentBranch.into());
-        ctx.schedule::<Self::Msg, _>(
             LOG_INTERVAL / 2,
             LOG_INTERVAL,
             ctx.myself(),
@@ -942,12 +946,12 @@ impl Receive<SystemEvent> for ChainManager {
         if let SystemEvent::ActorTerminated(evt) = msg {
             if let Some(mut peer) = self.peers.remove(evt.actor.uri()) {
                 peer.queued_block_headers
-                    .drain()
+                    .drain_filter(|_, _| true)
                     .for_each(|(_, missing_block)| {
                         self.chain_state.push_missing_block(missing_block).expect("Failed to re-schedule block hash");
                     });
 
-                self.operations_state.push_missing_block_operations(peer.queued_block_operations.drain().map(|(_, op)| op))
+                self.operations_state.push_missing_block_operations(peer.queued_block_operations.drain_filter(|_, _| true).map(|(_, op)| op))
                     .expect("Failed to return to queue")
             }
         }
@@ -1106,9 +1110,9 @@ struct PeerState {
     is_bootstrapped: bool,
 
     /// Queued blocks
-    queued_block_headers: HashMap<BlockHash, MissingBlock>,
+    queued_block_headers: BTreeMap<BlockHash, MissingBlock>,
     /// Queued block operations
-    queued_block_operations: HashMap<BlockHash, MissingOperations>,
+    queued_block_operations: BTreeMap<BlockHash, MissingOperations>,
     /// Level of the current head received from peer
     current_head_level: Option<i32>,
     /// Last time we received updated head from peer
@@ -1131,7 +1135,7 @@ struct PeerState {
     missing_mempool_operations: Vec<(OperationHash, MempoolOperationType)>,
     /// Queued mempool operations. This map holds an operation hash and
     /// a tuple of type of a mempool operation with its time to live.
-    queued_mempool_operations: HashMap<OperationHash, (MempoolOperationType, SystemTime)>,
+    queued_mempool_operations: BTreeMap<OperationHash, (MempoolOperationType, SystemTime)>,
 }
 
 impl PeerState {
@@ -1140,10 +1144,10 @@ impl PeerState {
             peer_ref,
             mempool_enabled: !peer_metadata.disable_mempool(),
             is_bootstrapped: false,
-            queued_block_headers: HashMap::new(),
-            queued_block_operations: HashMap::new(),
+            queued_block_headers: BTreeMap::new(),
+            queued_block_operations: BTreeMap::new(),
             missing_mempool_operations: Vec::new(),
-            queued_mempool_operations: HashMap::default(),
+            queued_mempool_operations: BTreeMap::default(),
             current_head_level: None,
             current_head_update_last: Instant::now(),
             block_request_last: Instant::now(),

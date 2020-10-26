@@ -46,6 +46,31 @@ pub struct PeerMessageResponse {
     body: BinaryDataCache,
 }
 
+impl PeerMessageResponse {
+    pub fn new(messages: Vec<PeerMessage>) -> Self {
+        PeerMessageResponse {
+            messages,
+            body: BinaryDataCache::default(),
+        }
+    }
+
+    pub fn push(&mut self, message: PeerMessage) {
+        self.messages.push(message);
+    }
+
+    pub fn flatten(v: Vec<Self>) -> Self {
+        let len = v.iter().map(|r| r.messages.len()).sum();
+        let mut messages = Vec::with_capacity(len);
+        for mut r in v {
+            messages.append(&mut r.messages);
+        }
+        PeerMessageResponse {
+            messages,
+            body: BinaryDataCache::default(),
+        }
+    }
+}
+
 cached_data!(PeerMessageResponse, body);
 has_encoding!(PeerMessageResponse, PEER_MESSAGE_RESPONSE_ENCODING, {
     Encoding::Obj(vec![
