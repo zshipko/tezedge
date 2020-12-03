@@ -47,13 +47,6 @@ pub fn is_ocaml_log_enabled() -> bool {
         .unwrap()
 }
 
-pub fn no_of_ffi_calls_treshold_for_gc() -> i32 {
-    env::var("OCAML_CALLS_GC")
-        .unwrap_or_else(|_| "2000".to_string())
-        .parse::<i32>()
-        .unwrap()
-}
-
 pub fn log_level() -> Level {
     env::var("LOG_LEVEL")
         .unwrap_or_else(|_| "info".to_string())
@@ -175,7 +168,6 @@ pub mod infra {
                 ProtocolEndpointConfiguration::new(
                     TezosRuntimeConfiguration {
                         log_enabled: common::is_ocaml_log_enabled(),
-                        no_of_ffi_calls_treshold_for_gc: common::no_of_ffi_calls_treshold_for_gc(),
                         debug_mode: false,
                     },
                     tezos_env.clone(),
@@ -202,7 +194,6 @@ pub mod infra {
                 ProtocolEndpointConfiguration::new(
                     TezosRuntimeConfiguration {
                         log_enabled: common::is_ocaml_log_enabled(),
-                        no_of_ffi_calls_treshold_for_gc: common::no_of_ffi_calls_treshold_for_gc(),
                         debug_mode: false,
                     },
                     tezos_env.clone(),
