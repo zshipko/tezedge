@@ -858,11 +858,13 @@ impl MerkleStorage {
 
     /// Set key/val to the staging area.
     fn set_stage_root(&mut self, tree: &Tree) {
+        // println!("new merkle root hash {}", hex::encode(hash_tree(&tree)));
         self.current_stage_tree = (tree.clone(), hash_tree(&tree));
     }
 
     /// Set key/val to the staging area.
     pub fn set(&mut self, key: &ContextKey, value: &ContextValue) -> Result<(), MerkleError> {
+        // panic!("{:?} {:?}",  key, value);
         let root = self.get_staged_root();
         let new_root_hash = &self._set(&root, key, value)?;
         self.set_stage_root(&self.get_tree(new_root_hash)?);
@@ -1034,6 +1036,8 @@ impl MerkleStorage {
         if *hash == self.current_stage_tree.1 {
             return Ok(());
         }
+
+        println!("!!!!!!!!!! backtracking !!!!!!!!!!!!!!");
 
         let entry = self
             .staged

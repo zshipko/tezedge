@@ -90,6 +90,8 @@ pub trait ContextApi {
     fn is_committed(&self, context_hash: &ContextHash) -> Result<bool, ContextError>;
 
     fn store_merkle_hash(&self, hash: EntryHash);
+
+    fn get_merkle_hash(&self) -> EntryHash;
 }
 
 impl ContextApi for TezedgeContext {
@@ -100,7 +102,7 @@ impl ContextApi for TezedgeContext {
         value: &ContextValue,
     ) -> Result<(), ContextError> {
         let mut merkle = self.merkle.write().expect("lock poisoning");
-        self.checkout_stage(&mut merkle);
+        self.checkout_stage(&mut merkle)?;
         merkle.set(key, value)?;
         self.store_hash(&merkle);
         Ok(())
@@ -126,7 +128,7 @@ impl ContextApi for TezedgeContext {
         let mut merkle = self.merkle.write().expect("lock poisoning");
 
         let date: u64 = date.try_into()?;
-        self.checkout_stage(&mut merkle);
+        self.checkout_stage(&mut merkle)?;
         let commit_hash = merkle.commit(date, author, message)?;
         let commit_hash = &commit_hash[..].to_vec();
 
@@ -170,7 +172,7 @@ impl ContextApi for TezedgeContext {
         key_prefix_to_delete: &ContextKey,
     ) -> Result<(), ContextError> {
         let mut merkle = self.merkle.write().expect("lock poisoning");
-        self.checkout_stage(&mut merkle);
+        self.checkout_stage(&mut merkle)?;
         merkle.delete(key_prefix_to_delete)?;
         self.store_hash(&merkle);
         Ok(())
@@ -182,7 +184,7 @@ impl ContextApi for TezedgeContext {
         key_prefix_to_remove: &ContextKey,
     ) -> Result<(), ContextError> {
         let mut merkle = self.merkle.write().expect("lock poisoning");
-        self.checkout_stage(&mut merkle);
+        self.checkout_stage(&mut merkle)?;
         merkle.delete(key_prefix_to_remove)?;
         self.store_hash(&merkle);
         Ok(())
@@ -195,7 +197,7 @@ impl ContextApi for TezedgeContext {
         to_key: &ContextKey,
     ) -> Result<(), ContextError> {
         let mut merkle = self.merkle.write().expect("lock poisoning");
-        self.checkout_stage(&mut merkle);
+        self.checkout_stage(&mut merkle)?;
         merkle.copy(from_key, to_key)?;
         self.store_hash(&merkle);
         Ok(())
@@ -203,21 +205,21 @@ impl ContextApi for TezedgeContext {
 
     fn get_key(&self, key: &ContextKey) -> Result<ContextValue, ContextError> {
         let mut merkle = self.merkle.write().expect("lock poisoning");
-        self.checkout_stage(&mut merkle);
+        self.checkout_stage(&mut merkle)?;
         let val = merkle.get(key)?;
         Ok(val)
     }
 
     fn mem(&self, key: &ContextKey) -> Result<bool, ContextError> {
         let mut merkle = self.merkle.write().expect("lock poisoning");
-        self.checkout_stage(&mut merkle);
+        self.checkout_stage(&mut merkle)?;
         let val = merkle.mem(key)?;
         Ok(val)
     }
 
     fn dirmem(&self, key: &ContextKey) -> Result<bool, ContextError> {
         let mut merkle = self.merkle.write().expect("lock poisoning");
-        self.checkout_stage(&mut merkle);
+        self.checkout_stage(&mut merkle)?;
         let val = merkle.dirmem(key)?;
         Ok(val)
     }
@@ -248,7 +250,7 @@ impl ContextApi for TezedgeContext {
     ) -> Result<Option<Vec<(ContextKey, ContextValue)>>, MerkleError> {
         let context_hash_arr: EntryHash = context_hash.as_slice().try_into()?;
         let mut merkle = self.merkle.write().expect("lock poisoning");
-        self.checkout_stage(&mut merkle);
+        self.checkout_stage(&mut merkle)?;
         merkle.get_key_values_by_prefix(&context_hash_arr, prefix)
     }
 
@@ -260,7 +262,7 @@ impl ContextApi for TezedgeContext {
     ) -> Result<StringTreeEntry, MerkleError> {
         let context_hash_arr: EntryHash = context_hash.as_slice().try_into()?;
         let mut merkle = self.merkle.write().expect("lock poisoning");
-        self.checkout_stage(&mut merkle);
+        self.checkout_stage(&mut merkle)?;
         merkle.get_context_tree_by_prefix(&context_hash_arr, prefix, depth)
     }
 
@@ -284,6 +286,10 @@ impl ContextApi for TezedgeContext {
 
     fn store_merkle_hash(&self, hash: EntryHash) {
         *self.merkle_hash.borrow_mut() = hash;
+    }
+
+    fn get_merkle_hash(&self) -> EntryHash{
+        *self.merkle_hash.borrow()
     }
 
 }
@@ -310,10 +316,9 @@ impl TezedgeContext {
         }
     }
 
-    fn checkout_stage(&self, merkle: &mut MerkleStorage) {
+    fn checkout_stage(&self, merkle: &mut MerkleStorage) -> Result<(), MerkleError>{
         merkle
             .stage_checkout(&self.merkle_hash.borrow())
-            .expect("stage_checkout has failed");
     }
 
     fn store_hash(&self, merkle: &MerkleStorage) {
